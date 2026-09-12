@@ -1,60 +1,159 @@
-const path = require("path");
-const express = require("express");
-const helmet = require("helmet");
-const nodemailer = require("nodemailer");
+import express from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import nodemailer from 'nodemailer';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const port = process.env.PORT || 10000;
-const publicDir = path.join(__dirname, "public");
+const PORT = process.env.PORT || 3000;
 
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: "20kb" }));
-app.use(express.urlencoded({ extended: false, limit: "20kb" }));
-app.use(express.static(publicDir, { extensions: ["html"] }));
+app.use(express.json({ limit: '32kb' }));
+app.use(express.static(path.join(__dirname, 'dist')));
 
-const clean = (value, length = 1000) => String(value || "").trim().slice(0, length);
+// --- Rate limiting (in-memory, per IP) ---
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_MAX = 5;
 
-app.post("/api/contact", async (req, res) => {
-  const name = clean(req.body.name, 120);
-  const email = clean(req.body.email, 180);
-  const phone = clean(req.body.phone, 80);
-  const service = clean(req.body.service, 120);
-  const message = clean(req.body.message, 3000);
-  const privacy = req.body.privacy === true || req.body.privacy === "on";
+function rateLimit(req, res, next) {
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip) || { count: 0, first: now };
 
-  if (!name || !email || !message || !privacy || !/^\S+@\S+\.\S+$/.test(email)) {
-    return res.status(400).json({ ok: false, message: "Bitte füllen Sie alle Pflichtfelder korrekt aus." });
+  if (now - entry.first > RATE_LIMIT_WINDOW) {
+    entry.count = 0;
+    entry.first = now;
   }
 
-  const required = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "CONTACT_TO"];
-  if (required.some((key) => !process.env[key])) {
-    console.log("Kontaktanfrage (E-Mail noch nicht konfiguriert):", { name, email, phone, service, message });
-    return res.status(503).json({ ok: false, message: "Das Formular ist noch nicht freigeschaltet. Bitte kontaktieren Sie uns telefonisch oder per E-Mail." });
+  entry.count++;
+  rateLimitMap.set(ip, entry);
+
+  if (entry.count > RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: 'Too many requests. Please try again later.' });
   }
 
+  next();
+}
+
+// --- Validation helpers ---
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 200;
+}
+
+function sanitize(str, maxLen) {
+  if (typeof str !== 'string') return '';
+  return str.trim().slice(0, maxLen);
+}
+
+// --- Contact API ---
+app.post('/api/contact', rateLimit, async (req, res) => {
   try {
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT),
-      secure: process.env.SMTP_SECURE === "true",
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-    });
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: process.env.CONTACT_TO,
-      replyTo: email,
-      subject: `Neue Anfrage von ${name} – ${service || "Allgemein"}`,
-      text: `Name: ${name}\nE-Mail: ${email}\nTelefon: ${phone || "–"}\nLeistung: ${service || "–"}\n\n${message}`
-    });
-    return res.json({ ok: true, message: "Vielen Dank. Ihre Anfrage wurde erfolgreich übermittelt." });
-  } catch (error) {
-    console.error("E-Mail-Versand fehlgeschlagen:", error.message);
-    return res.status(500).json({ ok: false, message: "Die Nachricht konnte gerade nicht gesendet werden. Bitte versuchen Sie es später erneut." });
+    const {
+      firstName, lastName, phone, email, address, zip, city,
+      subject, service, message, consent,
+    } = req.body;
+
+    // Honeypot check
+    if (req.body.website) {
+      return res.status(200).json({ success: true });
+    }
+
+    // Time-based bot protection (min 2 seconds to fill form)
+    const formTime = req.body._time;
+    if (formTime && Date.now() - formTime < 2000) {
+      return res.status(200).json({ success: true });
+    }
+
+    // Validate required fields
+    const errors = [];
+    if (!sanitize(firstName, 100)) errors.push('firstName');
+    if (!sanitize(lastName, 100)) errors.push('lastName');
+    if (!sanitize(phone, 50)) errors.push('phone');
+    if (!sanitize(email, 200) || !isValidEmail(email || '')) errors.push('email');
+    if (!sanitize(subject, 200)) errors.push('subject');
+    if (!service) errors.push('service');
+    if (!sanitize(message, 2000)) errors.push('message');
+    if (!consent) errors.push('consent');
+
+    if (errors.length > 0) {
+      return res.status(400).json({ error: 'Validation failed', fields: errors });
+    }
+
+    const cleanData = {
+      firstName: sanitize(firstName, 100),
+      lastName: sanitize(lastName, 100),
+      phone: sanitize(phone, 50),
+      email: sanitize(email, 200),
+      address: sanitize(address, 200),
+      zip: sanitize(zip, 20),
+      city: sanitize(city, 100),
+      subject: sanitize(subject, 200),
+      service: sanitize(service, 50),
+      message: sanitize(message, 2000),
+    };
+
+    const now = new Date();
+    const dateTime = now.toLocaleString('de-AT', { timeZone: 'Europe/Vienna' });
+
+    const fullName = `${cleanData.firstName} ${cleanData.lastName}`;
+    const emailSubject = `Neue Website-Anfrage – ${cleanData.service} – ${fullName}`;
+
+    const emailBody = [
+      `Neue Anfrage über guericke.at`,
+      ``,
+      `Name: ${fullName}`,
+      `Telefon: ${cleanData.phone}`,
+      `E-Mail: ${cleanData.email}`,
+      `Adresse: ${cleanData.address || '-'}`,
+      `PLZ: ${cleanData.zip || '-'}`,
+      `Ort: ${cleanData.city || '-'}`,
+      `Leistung: ${cleanData.service}`,
+      `Betreff: ${cleanData.subject}`,
+      ``,
+      `Nachricht:`,
+      `${cleanData.message}`,
+      ``,
+      `Datum: ${dateTime}`,
+    ].join('\n');
+
+    // Send email if SMTP is configured
+    if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+      const transporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST,
+        port: parseInt(process.env.SMTP_PORT || '587', 10),
+        secure: parseInt(process.env.SMTP_PORT || '587', 10) === 465,
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASS,
+        },
+      });
+
+      await transporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: process.env.CONTACT_EMAIL || process.env.SMTP_USER,
+        subject: emailSubject,
+        text: emailBody,
+        replyTo: cleanData.email,
+      });
+    }
+
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    // Never expose internal errors to the client
+    console.error('Contact form error:', err);
+    return res.status(500).json({ error: 'An internal error occurred.' });
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// SPA fallback - must be last
+app.get('/{*splat}', (req, res, next) => {
+  // Skip API routes
+  if (req.path.startsWith('/api/')) {
+    return next();
+  }
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
 
-app.use((_req, res) => res.status(404).sendFile(path.join(publicDir, "404.html")));
-
-app.listen(port, "0.0.0.0", () => console.log(`Guericke Gebäudetechnik läuft auf Port ${port}`));
+app.listen(PORT, () => {
+  console.log(`Guericke Gebäudetechnik server running on port ${PORT}`);
+});
